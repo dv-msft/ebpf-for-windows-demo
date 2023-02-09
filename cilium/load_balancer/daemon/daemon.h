@@ -116,6 +116,7 @@ typedef struct global_config
 {
     interface_info_t info;
     lb_mode_t mode{};
+    bool pin_only{};
     bool v4_enabled{};
     bool v6_enabled{};
 } global_config_t;

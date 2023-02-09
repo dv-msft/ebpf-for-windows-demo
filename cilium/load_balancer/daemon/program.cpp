@@ -12,12 +12,16 @@
 
 #include <iostream>
 #include <fstream>
+#include <format>
+#include <functional>
+#include <utility>
 
 #include <winsock2.h>
 #include <WS2tcpip.h>
 #include <iphlpapi.h>
 #include <stdio.h>
 #include <stdlib.h>
+
 #include "util.h"
 extern "C"
 {
@@ -416,8 +420,8 @@ Exit:
     return result;
 }
 
-static uint32_t
-_load_and_attach_xdp_program(_In_ const char* file)
+static std::pair<uint32_t, std::string>
+_load_and_attach_xdp_program(_In_ const char* file, bool attach_program)
 {
     uint32_t error = ERROR_SUCCESS;
     bpf_object* object = nullptr;
@@ -428,40 +432,50 @@ _load_and_attach_xdp_program(_In_ const char* file)
     bool tail_call_map_populated = false;
 
     // Load the program.
-    printf("Verifying the program ... \n");
-    
     object = bpf_object__open(file);
     if (!object) {
         error = errno;
-        printf("bpf_object__open failed with error %d\n", error);
+        std::cout << std::format("bpf_object__open() failed with error: {}\n", error);
         goto Exit;
     }
 
     // Get prog object for the "main" program.
     entry_program = bpf_object__find_program_by_name(object, XDP_ENTRY_PROGRAM);
     if (entry_program == nullptr) {
-        printf("Failed to find entry program: %s\n", XDP_ENTRY_PROGRAM);
+        std::cout << std::format("bpf_object__find_program_by_name() failed with error: {}\n", error);
         error = errno;
         goto Exit;
     }
 
-    if (bpf_program__set_type(entry_program, BPF_PROG_TYPE_XDP) < 0) {
-        printf("Failed to set program type for entry program: %s\n", XDP_ENTRY_PROGRAM);
-        error = errno;
+    // prior to loading this object, we need to set the 'program type' for all it's programs to 'xdp'.
+    [&]() {
+        struct bpf_program* program;
+        uint32_t i = 0;
+
+        bpf_object__for_each_program(program, object) {
+            if (bpf_program__set_type(program, BPF_PROG_TYPE_XDP) < 0) {
+                std::cout << std::format("bpf_program__set_type() failed for program:[{}] with error: {}\n", i, error);
+                error = errno;
+                break;
+            }
+            i++;
+        }
+    }();
+
+    if (error != ERROR_SUCCESS) {
         goto Exit;
     }
 
-    printf("Loading and attaching the program to XDP hook ...\n");
     if (bpf_object__load(object) < 0) {
         error = errno;
-        printf("bpf_object__load failed with error %d\n", error);
+        std::cout << std::format("bpf_object__load() failed with error: {}\n", error);
         goto Exit;
     }
     
     // Pin the program so that it is not unloaded when the daemon stops.
     if (bpf_program__pin(entry_program, XDP_PROGRAM_PIN_PATH) < 0) {
-        printf("Failed to pin entry program: %s\n", XDP_ENTRY_PROGRAM);
         error = errno;
+        std::cout << std::format("bpf_program__pin() failed with error: {}\n", error);
         goto Exit;
     }
     
@@ -470,16 +484,20 @@ _load_and_attach_xdp_program(_In_ const char* file)
     // Populate tail call map.
     error = _populate_tail_call_map(object);
     if (error != ERROR_SUCCESS) {
+        std::cout << std::format("_populate_tail_call_map() failed with error: {}\n", error);
         goto Exit;
     }
     tail_call_map_populated = true;
 
-    link = bpf_program__attach(entry_program);
-    if (!link) {
-        error = errno;
-        goto Exit;
+    if (attach_program) {
+        link = bpf_program__attach(entry_program);
+        if (!link) {
+            error = errno;
+            std::cout << std::format("bpf_program__attach() failed with error: {}\n", error);
+            goto Exit;
+        }
+        program_attached = true;
     }
-    program_attached = true;
 
 Exit:
     if (error != ERROR_SUCCESS) {
@@ -496,31 +514,40 @@ Exit:
     if (object != nullptr) {
         bpf_object__close(object);
     }
-    return error;
+
+    if (error != ERROR_SUCCESS ) {
+        return {error, {}};
+    }
+
+    return {error, XDP_PROGRAM_PIN_PATH};
 }
 
-uint32_t
-compile_and_load_xdp_program(_In_ const interface_info_t* info, lb_mode_t mode, bool track_code_flow)
+std::pair<uint32_t, std::string>
+compile_and_load_xdp_program(
+    _In_ const interface_info_t* info, lb_mode_t mode, bool compile_program, bool attach_program, bool track_code_flow)
 {
-    uint32_t result = ERROR_SUCCESS;
+    if (compile_program) {
+        uint32_t result = ERROR_SUCCESS;
 
-    // Compile the XDP program.
-    result = _compile_xdp_program(info, mode, track_code_flow);
-    if (result != ERROR_SUCCESS) {
-        printf("Failed to compile XDP program for %s mode.\n", mode == LB_MODE_DSR ? "DSR" : "SNAT");
-        return result;
+        // Compile the XDP program.
+        result = _compile_xdp_program(info, mode, track_code_flow);
+        if (result != ERROR_SUCCESS) {
+            std::cout <<
+                std::format("Failed to compile XDP program for {} mode.\n", mode == LB_MODE_DSR ? "DSR" : "SNAT");
+            return {result, {}};
+        }
     }
 
     // Now load and attach XDP program.
     std::string file_name("bpf_xdp_");
     file_name += (mode == LB_MODE_DSR ? "dsr.o" : "snat.o");
-    result = _load_and_attach_xdp_program(file_name.c_str());
+    auto [result, pin_path] = _load_and_attach_xdp_program(file_name.c_str(), attach_program);
     if (result != ERROR_SUCCESS) {
-        printf("Failed to load and attach the XDP program, error = %d\n", result);
-        return result;
+        std::cout << std::format("_load_and_attach_xdp_program() failed with error: {}\n", result);
+        return {result, pin_path};
     }
 
-    return ERROR_SUCCESS;
+    return {result, pin_path};
 }
 
 uint32_t

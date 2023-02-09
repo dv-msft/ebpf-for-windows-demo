@@ -4,10 +4,12 @@
 // daemon.cpp : This file contains the 'main' function. Program execution begins and ends there.
 //
 
+#include <format>
 #include <iostream>
 #include <string>
 #include <sstream>
 #include <vector>
+
 #include "daemon.h"
 #include "map.h"
 #include "service.h"
@@ -16,11 +18,13 @@
 
 #define OPTION_LB_MODE 1
 #define OPTION_DEVICE 2
+#define OPTION_PIN_ONLY 3
 
 #define LB_MODE_OPTION_STR "--bpf-lb-mode="
 #define DEVICES_OPTION_STR "--device="
 #define LB_MODE_OPTION_DSR_STR "dsr"
 #define LB_MODE_OPTION_SNAT_STR "snat"
+#define PROG_PIN_ONLY_OPTION_STR "--pin-only"
 
 #define COMMAND_INVALID 0
 #define COMMAND_SERVICE 1
@@ -280,22 +284,23 @@ static void
 _update_daemon_mode(lb_mode_t new_mode)
 {
     if (new_mode == global_config.mode) {
-        printf("New and old mode same, ignoring.\n");
+        std::cout << "New and old mode same, ignoring.\n";
         return;
     }
 
     clean_old_program_state();
     clean_old_pinned_maps();
 
-    uint32_t result = compile_and_load_xdp_program(&global_config.info, new_mode, false);
+    auto [result, pin_path] = compile_and_load_xdp_program(&global_config.info, new_mode, true, true, false);
     if (result != ERROR_SUCCESS) {
-        printf("Failed to compile and load XDP program. error=%d\n", result);
+        std::cout << std::format(
+            "{}: Attempt to compile and load xdp program failed with error: {}\n", __FUNCSIG__, result);
         global_config.mode = LB_MODE_INVALID;
         return;
     }
 
     // Add the services back.
-    printf("Re-configuring configured services ... \n");
+    std::cout << "Re-configuring configured services...\n";
     result = program_services_to_xdp_maps();
     if (result != ERROR_SUCCESS) {
         global_config.mode = LB_MODE_INVALID;
@@ -413,17 +418,25 @@ Exit:
     return ERROR_SUCCESS;
 }
 
-_Success_(return == ERROR_SUCCESS) uint32_t _parse_command(_In_ const char* command, _Out_ uint32_t* option)
+_Success_(return == ERROR_SUCCESS) uint32_t
+_parse_command(_In_ const char* command, _Out_ uint32_t* option)
 {
     std::string command_string(command);
     size_t offset = 0;
     if ((offset = command_string.find(std::string(LB_MODE_OPTION_STR))) == 0) {
+
         // --bpf-lb-mode=
         *option = OPTION_LB_MODE;
         return ERROR_SUCCESS;
     } else if ((offset = command_string.find(std::string(DEVICES_OPTION_STR))) == 0) {
+
         // --device=
         *option = OPTION_DEVICE;
+        return ERROR_SUCCESS;
+    } else if ((offset = command_string.find(std::string(PROG_PIN_ONLY_OPTION_STR))) == 0) {
+
+        // --pin-only
+        *option = OPTION_PIN_ONLY;
         return ERROR_SUCCESS;
     }
 
@@ -444,9 +457,11 @@ _parse_startup_arguments(int argc, _In_ char* argv[])
         if (option == OPTION_LB_MODE) {
             std::string option_string(argv[i] + strlen(LB_MODE_OPTION_STR));
             if (option_string.find(std::string(LB_MODE_OPTION_DSR_STR)) == 0) {
+
                 // Mode is DSR
                 global_config.mode = lb_mode_t::LB_MODE_DSR;
             } else if (option_string.find(std::string(LB_MODE_OPTION_SNAT_STR)) == 0) {
+
                 // Mode is SNAT
                 global_config.mode = lb_mode_t::LB_MODE_SNAT;
             } else {
@@ -456,10 +471,18 @@ _parse_startup_arguments(int argc, _In_ char* argv[])
         } else if (option == OPTION_DEVICE) {
             std::string option_string(argv[i] + strlen(DEVICES_OPTION_STR));
             global_config.info.name = get_wstring_from_string(option_string);
+        } else if (option == OPTION_PIN_ONLY) {
+            global_config.pin_only = true;
         } else {
             printf("error parsing paramater %s\n", argv[i]);
             return ERROR_INVALID_PARAMETER;
         }
+    }
+
+    if (global_config.info.name.size() == 0) {
+
+        printf("the \'--device=\' option is mandatory.\n");
+        return ERROR_INVALID_PARAMETER;
     }
 
     return ERROR_SUCCESS;
@@ -500,6 +523,31 @@ _print_global_config()
     printf("\n");
 }
 
+static uint32_t
+_pin_program(const global_config_t& config)
+{
+    std::cout << "Please be patient. This could take up to a few minutes (depending on your program complexity)...\n";
+    clean_old_program_state();
+    clean_old_pinned_maps();
+
+    // In this specific use case, we're loading the the pre-compiled program directly and hence do not need to compile
+    // it all over again (we pass 'false' as the 'compile_program' argument). Note that we're also _not_ attaching the
+    // program (to the interface) by specifying 'false' as the 'attach_program' argument.
+    auto [result, pin_path] = compile_and_load_xdp_program(&config.info, config.mode, false, false, false);
+    if (result != ERROR_SUCCESS) {
+        std::vector<char> error_message(256);
+        (void) strerror_s(&error_message[0], error_message.size(), result);
+        std::cout << std::format(
+            "Attempt to load and pin XDP program failed with error: {}. Error message: {}\n)",
+            result,
+            &error_message[0]);
+    } else {
+        std::cout << std::format("Program loaded and pinned at {}\n", pin_path);
+    }
+
+    return result;
+}
+
 int
 main(int argc, char* argv[])
 {
@@ -507,9 +555,10 @@ main(int argc, char* argv[])
 
     try {
         // Parse command line options.
-        if (argc != 3) {
-            printf("Invalid arguments\n");
-            printf("Example command: daemon.exe --bpf-lb-mode=<dsr/snat> --device=<device>\n");
+        if (argc < 3) {
+            std::cout << "Invalid arguments\n";
+            std::cout << "Example command:\n" <<
+                "\tdaemon.exe <--bpf-lb-mode=<dsr/snat> <--device=<device>> [--pin-only]\n";
             return ERROR_INVALID_PARAMETER;
         }
 
@@ -520,7 +569,7 @@ main(int argc, char* argv[])
 
         result = _initialize();
         if (result != ERROR_SUCCESS) {
-            printf("Initialize failed with error %d", result);
+            std::cout << std::format("_initialize() failed with error: {}", result);
             goto Exit;
         }
 
@@ -531,48 +580,60 @@ main(int argc, char* argv[])
         // Get interface properties.
         result = get_interface_properties(&global_config.info, global_config.v4_enabled, global_config.v6_enabled);
         if (result != ERROR_SUCCESS) {
-            printf(
-                "Failed to get interface properties for interface %ws, error %d\n",
-                global_config.info.name.c_str(),
-                result);
+
+            // Convert interface name from std::wstring to std::string for easy printing.
+            std::string if_name(global_config.info.name.length(), 0);
+            std::transform(
+                global_config.info.name.begin(),
+                global_config.info.name.end(),
+                if_name.begin(), [] (wchar_t c) {return (char)c;});
+            std::cout << std::format(
+                "Failed to get interface properties for interface: {}, Error: {}\n", if_name, result);
             goto Exit;
         }
 
         _print_global_config();
 
-        // Initialize cleanup event.
-        _cleanup_event = CreateEvent(nullptr, TRUE, FALSE, NULL);
-        if (_cleanup_event == NULL) {
-            printf("Failed to initialize cleanup event. Error=%d\n", GetLastError());
+        if (global_config.pin_only) {
+            (void) _pin_program(global_config);
+
+            // Irrespective of the result above, we're done.
             goto Exit;
         }
 
-        printf("Cleaning up previous configuration ...\n");
+        // Initialize cleanup event.
+        _cleanup_event = CreateEvent(nullptr, TRUE, FALSE, NULL);
+        if (_cleanup_event == NULL) {
+            std::cout << std::format("Failed to initialize cleanup event. Error: {}\n", GetLastError());
+            goto Exit;
+        }
+
+        std::cout << "Cleaning up previous configuration ...\n";
         clean_old_program_state();
         clean_old_pinned_maps();
 
-        result = compile_and_load_xdp_program(&global_config.info, global_config.mode, false);
-        if (result != ERROR_SUCCESS) {
-            printf("Failed to compile and load XDP program. error=%d\n", result);
+        auto [error, pin_path] = compile_and_load_xdp_program(&global_config.info, global_config.mode, true, true, false);
+        if (error != ERROR_SUCCESS) {
+            std::cout << std::format("{}: Failed to compile and load XDP program. error: {}\n", __FUNCSIG__, error);
             goto Exit;
         }
 
         // Spawn thread to take input from user.
         _thread_handle = CreateThread(NULL, 0, thread_proc, nullptr, 0, nullptr);
         if (_thread_handle == nullptr) {
-            printf("Failed to create worker thread. Error=%d\n", GetLastError());
+            std::cout << std::format("Failed to create worker thread. Error: {}\n", GetLastError());
             goto Exit;
         }
 
         set_foreground_color(green);
-        printf("Initialization complete.\n");
+        std::cout << "Initialization complete.\n";
         reset_foreground_color();
     } catch (const std::bad_alloc&) {
-        printf("Memory allocation failed.\n");
+        std::cout << "Memory allocation failed.\n";
         result = ERROR_NOT_ENOUGH_MEMORY;
         goto Exit;
     } catch (...) {
-        printf("Initialize hit an exception.\n");
+        std::cout << "Initialization hit an exception.\n";
         result = ERROR_INVALID_PARAMETER;
         goto Exit;
     }
@@ -582,6 +643,7 @@ Exit:
         CloseHandle(_cleanup_event);
     }
     if (_thread_handle) {
+        std::cout << "Waiting on work thread termination...\n";
         WaitForSingleObject(_thread_handle, INFINITE);
     }
 
